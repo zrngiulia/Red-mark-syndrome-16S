@@ -1,0 +1,1852 @@
+---
+title: "RMS skin microbiome over time, Zarantonello et al."
+author: "Giulia Zarantonello"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(
+    echo = FALSE,
+    message = FALSE,
+    warning = FALSE,
+    results = FALSE,
+    fig.align='center',
+    fig.pos='H',
+    fig.path = "Plots",
+    dev = c("png", "svg"),
+    dpi=500
+)
+
+rm(list=ls())
+
+library("knitr")
+library("data.table")
+library("ggplot2")
+library("tidyverse")
+library("viridis")
+library("vegan")
+library("tibble")
+library("TreeSummarizedExperiment")
+library("phyloseq")
+library("microbiome")
+library("forcats")
+library("SQMtools")
+library("ALDEx2")
+
+
+
+colours <- c("col_curves" = "blue",
+                 "0" = "#003f5c",
+                 "20" = "#58508d",
+                 "35" = "#bc5090",
+                 "50" = "#ff6361",
+                 "75" = "#ffa600",
+                 "95" = "#b2ac88",
+                 "112" = "#008585",
+             "control" = "#a6bba1",
+             "non-lesion" = "#4f6d6a",
+             "active lesion" = "#b93b2e",
+             "Healing or healed" = "#2c6d9b",
+             "asv_0014" = "#54ba87",
+             "asv_0022" = "#8754ba",
+             "asv_0032" = "#db9544"
+             )
+
+new_labels <- c("control" = "Control",
+             "non-lesion" = "Non-lesion",
+             "active lesion" = "Active lesion",
+             "Healing or healed" = "Healing or healed lesion")
+
+```
+
+```{r package-versions}
+packageVersion("knitr")
+packageVersion("data.table")
+packageVersion("ggplot2")
+packageVersion("tidyverse")
+packageVersion("viridis")
+packageVersion("vegan")
+packageVersion("tibble")
+packageVersion("TreeSummarizedExperiment")
+packageVersion("phyloseq")
+packageVersion("microbiome")
+packageVersion("forcats")
+packageVersion("SQMtools")
+packageVersion("ALDEx2")
+
+```
+
+# Make phyloseq objects, remove non-bacterial sequences
+
+Fix taxonomies, make phyloseq objects, filter non-bacterial, mitochondrial and chloroplast sequences, split between water and skin philoseq objects and mock samples phyloseq obj.
+
+```{r make ps objects, eval = F}
+#-------------------------------------------------------------------------------
+# Load metadata, count matrix, and taxonomies
+#-------------------------------------------------------------------------------
+smetadata <- read.csv('./All_data/skin_metadata.csv', row.names = 1)
+head(smetadata)
+dim(smetadata)
+wmetadata <- read.csv('./All_data/water_metadata.csv', row.names = 1)
+head(wmetadata)
+dim(wmetadata)
+# add a column with the sample_nr
+smetadata$sample_nr <- rownames(smetadata)
+dim(smetadata) #77 samples 
+wmetadata$sample_nr <- rownames(wmetadata)
+dim(wmetadata) #57 samples
+
+
+#load asv counts matrix
+count_matrix <- as.matrix(read.csv('./All_data/asvtab.nochim.csv', row.names = 1))
+dim(count_matrix) #134 samples
+head(count_matrix)
+str(count_matrix)
+# load taxonomy
+annotation_file <- as.data.frame(read.csv('./All_data/taxa.csv', row.names = 1))
+dim(annotation_file) # 7978    7
+
+#-------------------------------------------------------------------------------
+# Fix taxonomy
+#-------------------------------------------------------------------------------
+# Create species names by appending "genus species"; call intermediate missing ranks "[higher rank] (no [rank] in database)"; do the same for the few "Unknown Family" for which the genus is present; convert "incertae sedis" to "[lower rank] incertae sedis"; for the remaining NAs without higher rank classification, convert to "Unclassified [lower rank].
+
+# Append Genus Species when they are not NA
+annotation_file$Species <- ifelse(
+  !is.na(annotation_file$Genus) & !is.na(annotation_file$Species),
+  paste(annotation_file$Genus, annotation_file$Species),
+  annotation_file$Species
+)
+
+ranks <- c("Species", "Genus", "Family", "Order", "Class", "Phylum", "Kingdom")
+
+# convert these from factors to strings
+annotation_file[ranks] <- lapply(annotation_file[ranks], as.character)
+
+# Loop through each row to handle missing intermediate ranks: NAs
+for (idx in rownames(annotation_file)) {
+  lastRankFound <- "NA"
+  lastTaxFound <- "NA"
+  
+  for (rank in ranks) {
+    tax <- annotation_file[idx, rank]
+    
+    if (!is.na(tax) && tax != "NA") {
+      lastRankFound <- rank
+      lastTaxFound <- tax
+    } else if (lastRankFound != "NA") {
+      annotation_file[idx, rank] <- paste0(lastTaxFound, " (no ", rank, " in database)")
+    }
+  }
+}
+
+# Loop through each row to handle missing intermediate ranks: "Unknown Family"
+for (idx in rownames(annotation_file)) {
+  lastRankFound <- "Unknown Family"
+  lastTaxFound <- "Unknown Family"
+  
+  for (rank in ranks) {
+    tax <- annotation_file[idx, rank]
+    
+    if (!is.na(tax) && tax != "Unknown Family") {
+      lastRankFound <- rank
+      lastTaxFound <- tax
+    } else if (lastRankFound != "Unknown Family") {
+      annotation_file[idx, rank] <- paste0(lastTaxFound, " (no ", rank, " in database)")
+    }
+  }
+}
+
+
+# Loop through the ranks in reverse order to handle unclassified entries: Incertae Sedis
+for (idx in rownames(annotation_file)) {
+  lastTaxFound <- "Incertae Sedis"
+  
+  for (rank in rev(ranks)) {
+    tax <- annotation_file[idx, rank]
+    
+    if (!is.na(tax) && tax != "Incertae Sedis") {
+      lastTaxFound <- tax
+    }  else if (!is.na(tax) && tax == "Incertae Sedis") {
+      annotation_file[idx, rank] <- paste0(lastTaxFound, " Incertae Sedis")
+    }
+  }
+}
+
+# If family == unknown family, call it "Order (no Family in database)"
+for (idx in rownames(annotation_file)) {
+  if (!is.na(annotation_file[idx, "Family"]) &&
+      annotation_file[idx, "Family"] == "Unknown Family" &&
+      !is.na(annotation_file[idx, "Order"]) &&
+      annotation_file[idx, "Order"] != "NA") {
+        
+    annotation_file[idx, "Family"] <- paste0("Unclassified ", annotation_file[idx, "Order"])
+  }
+}
+
+
+
+# Loop through the ranks in reverse order to handle unclassified entries: NA
+for (idx in rownames(annotation_file)) {
+  lastTaxFound <- "NA"
+  
+  for (rank in rev(ranks)) {
+    tax <- annotation_file[idx, rank]
+    
+    if (!is.na(tax) && tax != "NA" && !startsWith(tax, "Unclassified ")) {
+      lastTaxFound <- tax
+    } else {
+      annotation_file[idx, rank] <- paste0("Unclassified ", lastTaxFound)
+    }
+  }
+}
+
+
+annotation_file <- as.matrix(annotation_file)
+
+#-------------------------------------------------------------------------------
+# separate between water and skin
+#-------------------------------------------------------------------------------
+# Separate count_matrix into scount_matrix and wcount_matrix
+scount_matrix <- count_matrix[grepl("^s", rownames(count_matrix)), ]
+wcount_matrix <- count_matrix[!grepl("^s", rownames(count_matrix)), ]
+
+#-------------------------------------------------------------------------------
+# Transform to phyloseq object
+#-------------------------------------------------------------------------------
+rms.ps <- merge_phyloseq(otu_table(as.matrix(scount_matrix), taxa_are_rows = F),
+                         tax_table(as.matrix(annotation_file)),
+                         sample_data(smetadata))
+
+wrms.ps <- merge_phyloseq(otu_table(as.matrix(wcount_matrix), taxa_are_rows = F),
+                         tax_table(as.matrix(annotation_file)),
+                         sample_data(wmetadata))
+
+
+
+#-------------------------------------------------------------------------------
+# Save RDS for ps objects
+#-------------------------------------------------------------------------------
+saveRDS(rms.ps, file = "./All_data/rms.ps.rds")
+saveRDS(wrms.ps, file = "./All_data/wrms.ps.rds")
+
+#-------------------------------------------------------------------------------
+# Split samples from controls
+#-------------------------------------------------------------------------------
+ps_mock <- subset_samples(rms.ps, sample_type=="mock") # mock communities
+ps_samples <- subset_samples(rms.ps, sample_type=="skin") # samples
+ps_samples # 7978 taxa and 75 samples
+# same for water
+ps_mockw <- subset_samples(wrms.ps, sample_nr=="zymo") # mock communities
+ps_samplesw <- subset_samples(wrms.ps, sample_nr!="zymo") # samples
+ps_samplesw # 7978 taxa and 56 samples
+
+#-------------------------------------------------------------------------------
+# Subsetting bacteria and archaea
+# take out family = mitochondria | order = chloroplasts
+#-------------------------------------------------------------------------------
+######## SAMPLES skin
+ps_samples <- subset_taxa(ps_samples, Kingdom == "Bacteria" | Kingdom =="Archaea")
+ps_samples # 7022 taxa and 75 samples
+ps_samples <- subset_taxa(ps_samples, !(Family == "Mitochondria" | Order == "Chloroplast"))
+ps_samples # 6901 taxa and 75 samples
+#remove zero count taxa
+ps_samples <- prune_taxa(taxa_sums(ps_samples) >= 1, ps_samples)
+ps_samples # 4558 taxa and 75 samples
+
+######## MOCK skin
+ps_mock <- subset_taxa(ps_mock, Kingdom == "Bacteria" | Kingdom =="Archaea")
+ps_mock # 7022 taxa and 2 samples
+#remove zero-count taxa
+# Remove samples with less than 1 read from phyloseq object
+ps_mock <- prune_taxa(taxa_sums(ps_mock) >= 1, ps_mock)
+ps_mock # 21 taxa and 2 samples
+
+######## SAMPLES water
+ps_samplesw <- subset_taxa(ps_samplesw, Kingdom == "Bacteria" | Kingdom =="Archaea")
+ps_samplesw # 7022 taxa and 56 samples
+ps_samplesw <- subset_taxa(ps_samplesw, !(Family == "Mitochondria" | Order == "Chloroplast"))
+ps_samplesw # 5265 taxa and 56 samples
+#remove zero count taxa
+ps_samplesw <- prune_taxa(taxa_sums(ps_samplesw) >= 1, ps_samplesw)
+ps_samplesw # 2386 taxa and 56 samples
+
+######## MOCK water
+ps_mockw <- subset_taxa(ps_mockw, Kingdom == "Bacteria" | Kingdom =="Archaea")
+ps_mockw # 7022 taxa and 1 samples
+#remove zero-count taxa
+# Remove samples with less than 1 read from phyloseq object
+ps_mockw <- prune_taxa(taxa_sums(ps_mockw) >= 1, ps_mockw)
+ps_mockw #  14 taxa and 1 samples
+
+
+
+#-------------------------------------------------------------------------------
+# Save RDS for mock and samples separately
+#-------------------------------------------------------------------------------
+
+saveRDS(ps_samples, file = "./All_data/rms.ps.samples.rds")
+saveRDS(ps_mock, file = "./All_data/rms.ps.mock.rds")
+
+saveRDS(ps_samplesw, file = "./All_data/rms.ps.samplesw.rds")
+saveRDS(ps_mockw, file = "./All_data/rms.ps.mockw.rds")
+
+```
+
+Make a common phyloseq object for water and skin samples again, to change sequence numbers from [actual ASV sequence] to [progressive numbering of sequences].
+
+```{r make a common ps object with NA in non-relevant metadata columns, eval=FALSE}
+#-------------------------------------------------------------------------------
+# Make common samples and mock ps objects
+#-------------------------------------------------------------------------------
+metas <- sample_data(ps_samples)
+metaw <- sample_data(ps_samplesw)
+
+# Find all unique column names from both metadata tables
+all_cols <- unique(c(colnames(metas), colnames(metaw)))
+
+# Ensure both metadata have the same columns
+for (col in all_cols) {
+    if (!(col %in% colnames(metas))) metas[[col]] <- NA
+    if (!(col %in% colnames(metaw))) metaw[[col]] <- NA
+}
+
+# Reorder columns to be consistent
+metas <- metas[, all_cols]
+metaw <- metaw[, all_cols]
+
+# Convert back to sample_data objects
+sample_data(ps_samples) <- sample_data(metas)
+sample_data(ps_samplesw) <- sample_data(metaw)
+
+all_sam_ps <- merge_phyloseq(ps_samples, ps_samplesw)
+all_sam_ps #6883 taxa and 131 samples
+
+saveRDS(all_sam_ps, file = "./All_data/all_sam_ps_asvSeq.rds")
+```
+
+Save the counts/sample in a table.
+*** Suppl.table3, counts_before_ASV1_removal column
+```{r, for common ps change sequences of asvs to asv0001 etc, eval=FALSE}
+
+ps_samples <- readRDS(file = "./All_data/all_sam_ps_asvSeq.rds")
+
+# change names of ASVs
+# this changes the header from the actual sequence to asv_001, asv_002 etc
+taxa_names(ps_samples)
+n_seqs <- seq(ntaxa(ps_samples))
+len_n_seqs <- nchar(max(n_seqs))
+taxa_names(ps_samples) <- paste("asv", formatC(n_seqs,
+                                       width = len_n_seqs,
+                                       flag = "0"), sep = "_")
+taxa_names(ps_samples)
+
+
+saveRDS(ps_samples, file = "./All_data/all_sam_ps_with_rtMit.rds")
+
+ps_samples <- readRDS("./All_data/all_sam_ps_with_rtMit.rds")
+otutable <- as.data.frame(as(otu_table(ps_samples), "matrix"))
+otutable$counts_before_rtMit_removal <- rowSums(otutable)
+otutable <- otutable[c("counts_before_rtMit_removal")]
+
+write.csv(otutable, "./Tables/01.seqDepth_before_rtMitRemoval_outlRemoval_befRarefaction.csv",
+          quote = FALSE)
+
+```
+
+After verifying that ASV 1 is a mitochondrial sequence from rainbow trout, remove it.
+
+Save counts/sample in a table after ASV 1 removal.
+*** Suppl.table3, counts_after_ASV1_removal column
+```{r remove rainbow trout mitochondria, eval=FALSE}
+rt_mitochondria_seq <- "TACGAGAGGCCCTAGTTGATAACTACCGGCGTAAAGAGTGGTTATGGAAAAATATTTAATAAAGCCGAACACCCCCTCAGCCGTCATACGCACCTGGGAGCACGAAGACCTACTGCGAAAGCAGCTTTAACTATGCCTGACCCCACGACAGCTAAGAAACAAACTGGG"
+
+rt_mitochondria_asv <- "asv_0001"
+
+ps_samples <- readRDS(file = "./All_data/all_sam_ps_with_rtMit.rds")
+ps_samples #6883 taxa and 131 samples
+ps_samples <- subset_taxa(ps_samples, taxa_names(ps_samples) != rt_mitochondria_asv)
+ps_samples #6882 taxa and 131 samples
+
+saveRDS(ps_samples, file = "./All_data/all_sam_ps.rds")
+
+
+
+ps_samples <- readRDS("./All_data/all_sam_ps.rds")
+otutable <- as.data.frame(as(otu_table(ps_samples), "matrix"))
+otutable$counts_after_rtMit_removal <- rowSums(otutable)
+otutable <- otutable[c("counts_after_rtMit_removal")]
+
+write.csv(otutable, "./Tables/02.seqDepth_afterRtMitRemoval_befOutlRemoval_befRarefaction.csv",
+          quote = FALSE)
+
+```
+
+# Identification of outliers
+*** Suppl. figure 1, rarefaction curves all skin samples
+```{r rarefaction-curves-skin-asv-outliers}
+############################ LOAD PHYLOSEQ OBJECT
+all_sam_ps <- readRDS(file = "./All_data/all_sam_ps.rds")
+all_sam_ps
+
+# split to skin or water
+skin_ps <- subset_samples(all_sam_ps, sample_type == "skin" )
+skin_ps
+skin_ps <- prune_taxa(taxa_sums(skin_ps) >= 1, skin_ps)
+skin_ps
+
+# Extract the OTU table from the phyloseq object
+otu_table <- as(otu_table(skin_ps), "matrix")
+
+# Rarefaction curve
+rarecurve(otu_table, step = 100,
+          sample = min(rowSums(otu_table)),
+          col = "blue",
+          cex = 0.6,
+          xlab = "Number of reads",
+          ylab = "Observed features")
+```
+
+*** Suppl. figure 1, phylum relative abundance
+```{r rel-abund-phylum-skin-outliers}
+#-------------------------------------------------------------------------------
+# Extract and rarefy counts to the same depth as the skin samples will be rarefied later in the study
+all_sam_ps_rare <- rarefy_even_depth(all_sam_ps,
+                                     #sample.size = min(sample_sums(all_sam_ps)),
+                                     sample.size = 9756,
+                                     rngseed = 123,
+                                     replace = TRUE,
+                                     trimOTUs = TRUE,
+                                     verbose = TRUE)
+all_sam_ps_rare #2552 taxa and 125 samples. Sample s22.379.61 was excluded
+
+
+# split to skin or water
+skin_ps <- subset_samples(all_sam_ps_rare, sample_type == "skin" )
+skin_ps
+skin_ps <- prune_taxa(taxa_sums(skin_ps) >= 1, skin_ps)
+skin_ps #1541 taxa and 70 samples
+#-------------------------------------------------------------------------------
+
+# Choose how many taxa to display as main in stacked barplot
+groups_to_show <- 10
+############################ REL ABUND & TAXA AGGLOMERATION ####
+#### AGGLOMERATE AT PHYLUM
+skin_ps.rank <- tax_glom(skin_ps, taxrank = "Phylum") # agglomerate at Phylum level
+skin_ps.rank.ra <- transform_sample_counts(skin_ps.rank, function(x) {x/sum(x)*100}) # transform to relative abundance
+sample_sums(skin_ps.rank.ra) # everybody adds up to 100 now!
+skin_ps.rank.melt <- psmelt(skin_ps.rank.ra) # melt into long-format table (adds metadata)
+skin_ps.rank.melt # let's take a look at it
+skin_ps.rank.melt <- skin_ps.rank.melt %>% # create new column with mean RA for each phylum
+  group_by(Phylum) %>%
+  mutate(mean_rel_abund = mean(Abundance))
+
+# choose top 20 and call the rest "Others"
+top_taxa <- rownames(t(mostAbundant(otu_table(skin_ps.rank.ra), bycol=T, others=T, N=groups_to_show)))
+skin_ps.rank.melt$Phylum <- ifelse(skin_ps.rank.melt$OTU %in% top_taxa, skin_ps.rank.melt$Phylum, "Others")
+skin_ps.rank.melt$Phylum = factor(skin_ps.rank.melt$Phylum)
+skin_ps.rank.melt$Phylum <- fct_relevel(skin_ps.rank.melt$Phylum, "Others", after = Inf) # Move "Others" to the end
+
+skin_ps.rank.melt$sample_nr_sub <- sub("^s22\\.379\\.", "", skin_ps.rank.melt$sample_nr)
+
+ggplot(skin_ps.rank.melt, aes(x= sample_nr_sub, y= Abundance, fill = Phylum)) +
+  facet_wrap(~factor(skin_type, levels = c("control", "non-lesion", "lesion")) +
+               factor(Cohab_day, levels = c("0", "35", "50", "75", "95", "112")),
+             scales = "free_x",
+             nrow = 3,
+             drop = FALSE) +
+  theme_bw(base_size = 12) +
+  labs(y= "Relative Abundance (%)") +
+  geom_bar(stat = "identity")+
+  ggthemes::scale_fill_tableau("Tableau 20") +
+  theme(strip.text = element_text(size = 10),
+        axis.text.y = element_text(colour = "black", size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+        axis.title.x = element_blank(),
+        panel.grid = element_blank())
+
+
+```
+
+*** Suppl. figure 1, RPCA at ASV level
+```{r rpca-outliers-asv-level}
+#-------------------------------------------------------------------------------
+# prepare for Gemelli at ASV level: skin samples
+#-------------------------------------------------------------------------------
+
+# Read rms.ps
+rms.ps.samples <- skin_ps
+rms.ps.samples # 1261 taxa and 68 samples
+
+# Extract metadata, tax info, raw counts
+metadata <- as.data.frame(sample_data(rms.ps.samples))
+metadata <- as.data.frame(as(metadata, "data.frame"))
+tax_info <- as.data.frame(tax_table(rms.ps.samples))
+counts <- as.data.frame(otu_table(rms.ps.samples))
+
+# Add ASV name as a column of tax_table and only keep that one
+tax_info$asv_id <- row.names(tax_info)
+# From tax_info, only keep ASV column and merge with counts by rownames
+df <- tax_info[, "asv_id", drop = FALSE]
+# Convert rownames to a new column in both data frames
+df$SampleID <- rownames(df)
+counts <- as.data.frame(t(counts))
+counts$SampleID <- rownames(counts)
+# Merge the two data frames by 'SampleID'
+merged_df <- merge(df, counts, by = "SampleID")
+
+# Set the row names of the merged data frame to 'asv_id' and remove the columns "asv_id" and "SampleID"
+rownames(merged_df) <- merged_df$asv_id
+merged_df$SampleID <- NULL
+merged_df$asv_id <- NULL
+
+write.table(merged_df, file="./All_data/gemelli_asv_OUTLIERS_rarefied.tsv", quote = FALSE, sep = "\t")
+write.table(metadata, file = "./All_data/all_metadata_filt_OUTLIERS_rarefied.csv", quote = FALSE, sep = ",")
+
+#-------------------------------------------------------------------------------
+# These files are loaded into server and Gemelli RPCA is run.
+# Then the ordination file is downloaded and loaded for plotting 
+#-------------------------------------------------------------------------------
+
+# Read the ord.gemelli RDS file
+ord.gemelli <- readRDS("./All_data/ord-gemelli-asv-rare-OUTLIERS-rda.rds")
+
+# Load metadata and drop control rows (which are not in ordination)
+metadata <- read.table("./All_data/all_metadata_filt_OUTLIERS_rarefied.csv", header=TRUE, sep=",", check.names=FALSE, row.names=1)
+
+#calculate proportion of "variance", here expressed as inertia
+ord.gemelli$CA$eig  # access the inertia values
+perc <- ord.gemelli$CA$eig**2/sum(ord.gemelli$CA$eig**2)  # calculate the proportions
+
+# Extract samples PCs in a new df
+ggdf=ord.gemelli$CA$u
+
+# Add metadata
+ggdf <- cbind(ggdf, metadata[rownames(ggdf),])
+
+
+# Set the factor levels for 'development' in the desired order
+ggdf$gross_pathology <- factor(ggdf$gross_pathology, levels = c(
+  "control", 
+  "non-lesion",
+  "active lesion",
+  "Healing or healed"
+))
+
+# plot ordination with ggplot
+ggplot(ggdf, aes(x=PC1, y=PC2, col=as.factor(Cohab_day), shape = gross_pathology)) +
+  geom_point(size =3) +
+  scale_color_manual(values = colours) +
+  labs(title = "Robust Aitchison PCA - ASV Level",
+       shape = "Sample type",
+       color = "DPC",
+       x = paste("PC1 (", round(perc[1]*100, 2), "%)"),
+       y = paste("PC2 (", round(perc[2]*100, 2), "%)")) +
+  theme_bw(base_size=12) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey") +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "grey")
+
+```
+
+Remove outliers: samples number 11, 21, 22, 48, 56.
+
+```{r remove-outliers}
+all_sam_ps <- readRDS(file = "./All_data/all_sam_ps.rds")
+all_sam_ps
+
+# Exclude outliers
+all_sam_ps <- subset_samples(all_sam_ps, !rownames(sample_data(all_sam_ps)) %in% c("s22.379.11", "s22.379.21", "s22.379.22", "s22.379.48", "s22.379.56"))
+all_sam_ps #5249 taxa and 126 samples
+
+#remove zero count taxa
+all_sam_ps <- prune_taxa(taxa_sums(all_sam_ps) >= 1, all_sam_ps)
+all_sam_ps # down to 2810  taxa. A lot were only present in these 5 samples.
+
+# split to skin or water
+skin_ps <- subset_samples(all_sam_ps, sample_type == "skin" )
+skin_ps
+skin_ps <- prune_taxa(taxa_sums(skin_ps) >= 1, skin_ps)
+skin_ps
+
+wat_ps <- subset_samples(all_sam_ps, sample_type == "water" )
+wat_ps
+wat_ps <- prune_taxa(taxa_sums(wat_ps) >= 1, wat_ps)
+wat_ps
+
+# Write an RDS file in this folder without outliers
+saveRDS(all_sam_ps, file = "./All_data/all_sam_ps.no.outliers.rds")
+saveRDS(skin_ps, file = "./All_data/skin_ps.no.outliers.rds")
+saveRDS(wat_ps, file = "./All_data/wat_ps.no.outliers.rds")
+
+```
+
+
+# Rarefaction curves
+
+```{r load-no-outlier-ps-obj-and-split-for-plotting-before-rarefaction}
+
+############################ LOAD PHYLOSEQ OBJECT
+all_sam_ps <- readRDS(file = "./All_data/all_sam_ps.no.outliers.rds")
+all_sam_ps # 3890 taxa and 126 samples
+
+# split to skin or water
+skin_ps <- subset_samples(all_sam_ps, sample_type == "skin" )
+skin_ps
+skin_ps <- prune_taxa(taxa_sums(skin_ps) >= 1, skin_ps)
+skin_ps #1541 taxa and 70 samples
+
+wat_ps <- subset_samples(all_sam_ps, sample_type == "water" )
+wat_ps
+wat_ps <- prune_taxa(taxa_sums(wat_ps) >= 1, wat_ps)
+wat_ps # 2385 taxa and 56 samples 
+
+```
+
+*** Suppl. figure 2, skin before rarefaction observed asvs and shannon
+```{r skin-rarefaction-curves-asv-no-outliers-before-rarefaction}
+#-------------------------------------------------------------------------------
+# Rarefaction curve before rarefying: skin
+#-------------------------------------------------------------------------------
+otu_table <- as(otu_table(skin_ps), "matrix")
+rarecurve(otu_table, step = 100,
+          sample = min(rowSums(otu_table)),
+          col = "blue",
+          cex = 0.5,
+          xlab = "Number of reads",
+          ylab = "Observed features (ASVs)")
+
+#-------------------------------------------------------------------------------
+#shannon-curves-before-rarefaction-skin
+#-------------------------------------------------------------------------------
+# Rarefaction curve (Shannon)
+###### Need to make the loop to account for uneven sampling depths.
+# Get sample names and individual sequencing depths
+sample_names <- rownames(otu_table)
+sample_depths <- rowSums(otu_table)
+
+NUM_REPLICATES <- 10
+
+# Initialize vectors
+depths <- c()
+samples <- c()
+shannons <- c()
+
+for (s in seq_along(sample_names)) {
+  sample_name <- sample_names[s]
+  max_depth <- sample_depths[s]
+  sample_counts <- otu_table[sample_name, , drop = FALSE]
+  
+  # Generate rarefaction depths for this sample
+  list_of_depths <- c(500 * (1:trunc(max_depth / 500)), max_depth)
+  
+  for (depth in list_of_depths) {
+    for (i in 1:NUM_REPLICATES) {
+      rar_sample <- rrarefy(sample_counts, depth)
+      shan <- vegan::diversity(rar_sample)
+      
+      depths <- c(depths, depth)
+      samples <- c(samples, sample_name)
+      shannons <- c(shannons, shan)
+    }
+  }
+}
+
+
+
+ggdf_skin = data.frame(depths=depths, samples=samples, shannons=shannons)
+p <-ggplot(ggdf_skin, aes(x=depths, y = shannons, group = samples)) +
+  stat_summary(fun=mean, geom="line", color = "blue") +
+  labs(x="Number of reads",
+       y="Shannon diversity")+
+  theme_bw() +
+  theme(legend.position="none")
+p
+
+```
+
+*** Suppl. figure 2, water before rarefaction observed asvs and shannon
+```{r water-rarefaction-curves-asv-no-outliers-before-rarefaction}
+#-------------------------------------------------------------------------------
+# rarefaction curve before rarefying: water
+#-------------------------------------------------------------------------------
+otu_table <- as(otu_table(wat_ps), "matrix")
+rarecurve(otu_table, step = 100,
+          sample = min(rowSums(otu_table)),
+          col = "blue",
+          cex = 0.5,
+          xlab = "Number of reads",
+          ylab = "Observed features (ASVs)")
+
+#-------------------------------------------------------------------------------
+#r shannon-curves-before-rarefaction-water
+#-------------------------------------------------------------------------------
+# Rarefaction curve (Shannon)
+###### Need to make the loop to account for uneven sampling depths.
+# Get sample names and individual sequencing depths
+sample_names <- rownames(otu_table)
+sample_depths <- rowSums(otu_table)
+
+NUM_REPLICATES <- 10
+
+# Initialize vectors
+depths <- c()
+samples <- c()
+shannons <- c()
+
+for (s in seq_along(sample_names)) {
+  sample_name <- sample_names[s]
+  max_depth <- sample_depths[s]
+  sample_counts <- otu_table[sample_name, , drop = FALSE]
+  
+  # Generate rarefaction depths for this sample
+  list_of_depths <- c(500 * (1:trunc(max_depth / 500)), max_depth)
+  
+  for (depth in list_of_depths) {
+    for (i in 1:NUM_REPLICATES) {
+      rar_sample <- rrarefy(sample_counts, depth)
+      shan <- vegan::diversity(rar_sample)
+      
+      depths <- c(depths, depth)
+      samples <- c(samples, sample_name)
+      shannons <- c(shannons, shan)
+    }
+  }
+}
+
+
+ggdf_wat = data.frame(depths=depths, samples=samples, shannons=shannons)
+p <-ggplot(ggdf_wat, aes(x=depths, y = shannons, group = samples)) +
+  stat_summary(fun=mean, geom="line", colour = "blue") +
+  labs(x="Number of reads",
+       y="Shannon diversity")+
+  theme_bw() +
+  theme(legend.position="none")
+p
+
+```
+
+After removal of ASV 1 and outlier samples, save table with nr reads for each sample before rarefaction.
+```{r nonrarefied-nr-reads-sample}
+############################ LOAD PHYLOSEQ OBJECT
+all_sam_ps <- readRDS(file = "./All_data/all_sam_ps.no.outliers.rds")
+all_sam_ps # 3890 taxa and 126 samples
+# extract the otu table as matrix
+table_readcounts_nonrar <- as.data.frame(as(otu_table(all_sam_ps), "matrix"))
+# make a new column called "read_count" and select only that one
+table_readcounts_nonrar$read_count <- rowSums(table_readcounts_nonrar)
+table_readcounts_nonrar <- table_readcounts_nonrar[c("read_count")]
+
+kable(x = table_readcounts_nonrar)
+
+write.csv(table_readcounts_nonrar,
+          file = "./Tables/03.seqDepth_before_rar_outl_removed.csv",
+          quote = FALSE)
+
+```
+
+Rarefaction of skin.
+*** Suppl. figure 2, skin after rarefaction observed asvs
+```{r, rarefied-skin-observed}
+############################ LOAD PHYLOSEQ OBJECT
+all_sam_ps <- readRDS(file = "./All_data/all_sam_ps.no.outliers.rds")
+
+# Extract and rarefy counts
+all_sam_ps_rare <- rarefy_even_depth(all_sam_ps,
+                                     #sample.size = min(sample_sums(all_sam_ps)),
+                                     sample.size = 9756,
+                                     rngseed = 123,
+                                     replace = TRUE,
+                                     trimOTUs = TRUE,
+                                     verbose = TRUE)
+all_sam_ps_rare #2552 taxa and 125 samples. Sample s22.379.61 was excluded
+
+
+# split to skin or water
+skin_ps <- subset_samples(all_sam_ps_rare, sample_type == "skin" )
+skin_ps
+skin_ps <- prune_taxa(taxa_sums(skin_ps) >= 1, skin_ps)
+skin_ps #1541 taxa and 70 samples
+
+# Extract the OTU table from the phyloseq object
+otu_table <- as(otu_table(skin_ps), "matrix")
+
+
+# Rarefaction curve
+rarecurve(otu_table, step = 100,
+          sample = min(rowSums(otu_table)),
+          col = "blue",
+          cex = 0.6,
+          xlab = "Number of reads",
+          ylab = "Observed features (ASVs)")
+```
+
+*** Suppl. figure 2, skin after rarefaction shannon
+```{r shannon-curves-after-rarefaction-skin}
+# Rarefaction curve (Shannon)
+depths = c()
+samples = c()
+shannons = c()
+
+NUM_REPLICATES = 10
+
+rar_depths = c(100*1:97, 9756)
+for(depth in rar_depths) {
+  for(i in 1:NUM_REPLICATES) {
+    rar_table = rrarefy(otu_table, depth)
+    shan = vegan::diversity(rar_table) # explicitly call the `vegan` package name here since the `diversity` function may be masked by a different package
+    depths = c(depths, rep(depth, length(shan)))
+    samples = c(samples, names(shan))
+    shannons = c(shannons, shan)
+  }
+}
+
+ggdf = data.frame(depths=depths, samples=samples, shannons=shannons)
+p <-ggplot(ggdf, aes(x=depths, y = shannons, group = samples)) +
+  stat_summary(fun=mean, geom="line", colour = "blue") +
+  labs(x="Number of reads",
+       y="Shannon diversity")+
+  theme_bw() +
+  theme(legend.position="none")
+p
+```
+
+Rarefaction of water.
+*** Suppl. figure 2, water after rarefaction observed asvs
+```{r, rarefied-water-observed}
+#Lowest sample size water
+min(sample_sums(wat_ps))
+# 35658
+
+############################ LOAD PHYLOSEQ OBJECT
+all_sam_ps <- readRDS(file = "./All_data/all_sam_ps.no.outliers.rds")
+
+# Extract and rarefy counts
+all_sam_ps_rare <- rarefy_even_depth(all_sam_ps,
+                                     #sample.size = min(sample_sums(all_sam_ps)),
+                                     sample.size = 35658,
+                                     rngseed = 123,
+                                     replace = TRUE,
+                                     trimOTUs = TRUE,
+                                     verbose = TRUE)
+all_sam_ps_rare #
+
+
+# split to skin or water
+wat_ps <- subset_samples(all_sam_ps_rare, sample_type == "water" )
+wat_ps
+wat_ps <- prune_taxa(taxa_sums(wat_ps) >= 1, wat_ps)
+wat_ps #2144 taxa and 56 samples
+
+# Extract the OTU table from the phyloseq object
+otu_table <- as(otu_table(wat_ps), "matrix")
+
+
+# Rarefaction curve OBSERVED ASVs
+rarecurve(otu_table, step = 100,
+          sample = min(rowSums(otu_table)),
+          col = "blue",
+          cex = 0.6,
+          xlab = "Number of reads",
+          ylab = "Observed features (ASVs)")
+```
+
+*** Suppl. figure 2, water after rarefaction shannon
+```{r shannon-curves-after-rarefaction-water}
+# Rarefaction curve (Shannon)
+depths = c()
+samples = c()
+shannons = c()
+
+NUM_REPLICATES = 10
+
+rar_depths = c(250*1:140, 35658)
+for(depth in rar_depths) {
+  for(i in 1:NUM_REPLICATES) {
+    rar_table = rrarefy(otu_table, depth)
+    shan = vegan::diversity(rar_table) # explicitly call the `vegan` package name here since the `diversity` function may be masked by a different package
+    depths = c(depths, rep(depth, length(shan)))
+    samples = c(samples, names(shan))
+    shannons = c(shannons, shan)
+  }
+}
+
+ggdf = data.frame(depths=depths, samples=samples, shannons=shannons)
+p <-ggplot(ggdf, aes(x=depths, y = shannons, group = samples)) +
+  stat_summary(fun=mean, geom="line", colour = "blue") +
+  labs(x="Number of reads",
+       y="Shannon diversity")+
+  theme_bw() +
+  theme(legend.position="none")
+p
+```
+
+
+```{r save-rarefied-objects}
+# Merge rarefied skin (9700 reads/sample) and rarefied water (35K reads/sample)
+all_sam_ps_rare <- merge_phyloseq(skin_ps, wat_ps)
+all_sam_ps_rare #3278 taxa and 125 samples
+
+# save RDS file of rarefied dataset
+saveRDS(all_sam_ps_rare, file = "./All_data/all_sam_ps.no.outliers.rarefied.rds")
+
+saveRDS(skin_ps, file = "./All_data/skin_ps.no.outliers.rarefied.rds")
+
+saveRDS(wat_ps, file = "./All_data/wat_ps.no.outliers.rarefied.rds")
+
+```
+
+# Mock communities
+
+```{r mocks-relative-abundances-genera}
+ps_mocks <- readRDS("./All_data/rms.ps.mock.rds")
+ps_mockw <- readRDS("./All_data/rms.ps.mockw.rds")
+
+all_mocks <- merge_phyloseq(ps_mocks, ps_mockw)
+
+#rename samples
+name_map <- c("s.zymo1" = "Zymo-S",
+              "s.zymo2" = "ZymoDNA",
+              "zymo"      = "Zymo-W")
+# Apply the renaming
+sample_names(all_mocks) <- ifelse(sample_names(all_mocks) %in% names(name_map),
+                            name_map[sample_names(all_mocks)],
+                            sample_names(all_mocks))
+
+# Choose how many taxa to display
+groups_to_show <- 8
+
+#agglomerate
+ps.rank <- tax_glom(all_mocks, taxrank = "Genus") # agglomerate at rank level
+ps.rank.ra <- transform_sample_counts(ps.rank, function(x) {x/sum(x)*100}) # transform to relative abundance
+sample_sums(ps.rank.ra) # everybody adds up to 100 now!
+ps.rank.melt <- psmelt(ps.rank.ra) # melt into long-format table (adds metadata)
+ps.rank.melt # take a look
+ps.rank.melt <- ps.rank.melt %>% # create new column with mean RA for each phylum
+  group_by(Genus) %>%
+  mutate(mean_rel_abund = mean(Abundance))
+
+# choose top N features and call the rest "Others"
+top_taxa <- rownames(t(mostAbundant(otu_table(ps.rank.ra), bycol=T, others=T, N=groups_to_show)))
+ps.rank.melt$Genus <- ifelse(ps.rank.melt$OTU %in% top_taxa, ps.rank.melt$Genus, "Others")
+ps.rank.melt$Genus = factor(ps.rank.melt$Genus)
+ps.rank.melt$Genus <- fct_relevel(ps.rank.melt$Genus, "Others", after = Inf) # Move "Others" to the end
+
+
+ggplot(ps.rank.melt, aes(x= Sample, y= Abundance, fill = Genus)) +
+  theme_bw(base_size = 12) +
+  labs(y= "Relative Abundance (%)") +
+  geom_bar(stat = "identity")+
+  ggthemes::scale_fill_tableau("Tableau 20") +
+  theme(strip.text = element_text(size = 10),
+        axis.text.y = element_text(colour = "black", size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.x = element_blank(),
+        panel.grid = element_blank())
+```
+
+
+Theoretical composition
+```{r theoretical-composition-zymobiomics-mocks}
+# From the technical datasheet of ZymoBIOMICS #D6300 and #D6305
+Sample <- rep("Theoretical", 8)
+Genus <- c("Pseudomonas",
+           "Escherichia",
+           "Salmonella",
+           "Lactobacillus",
+           "Enterococcus",
+           "Staphylococcus",
+           "Listeria",
+           "Bacillus")
+Species <- c("Pseudomonas aeruginosa",
+           "Escherichia coli",
+           "Salmonella enterica",
+           "Lactobacillus fermentum",
+           "Enterococcus faecalis",
+           "Staphylococcus aureus",
+           "Listeria monocytogenes",
+           "Bacillus subtilis")
+Abundance <- c(4.2,
+               10.1,
+               10.4,
+               18.4,
+               9.9,
+               15.5,
+               14.1,
+               17.4)
+theoretical <- data.frame(
+  Sample = Sample,
+  Abundance = Abundance,
+  Genus = Genus,
+  Species = Species,
+  stringsAsFactors = FALSE
+)
+
+ggplot(theoretical, aes(x= Sample, y= Abundance, fill = Species)) +
+  theme_bw(base_size = 12) +
+  labs(y= "Relative Abundance (%)") +
+  geom_bar(stat = "identity")+
+  #scale_fill_manual(values = tableau_colors) + 
+  ggthemes::scale_fill_tableau("Tableau 20") +
+  theme(strip.text = element_text(size = 10),
+        axis.text.y = element_text(colour = "black", size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        #axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        panel.grid = element_blank())
+```
+
+
+# Water and skin relative abundances
+```{r read-samples-phyloseq}
+all_sam_ps <- readRDS(file = "./All_data/all_sam_ps.no.outliers.rarefied.rds")
+all_sam_ps # 2552 taxa and 125 samples
+
+skin_ps <- readRDS(file = "./All_data/skin_ps.no.outliers.rarefied.rds")
+skin_ps # 1165 taxa and 69 samples
+
+wat_ps <- readRDS(file = "./All_data/wat_ps.no.outliers.rarefied.rds")
+wat_ps # 1414 taxa and 56 samples
+
+
+# Choose how many groups to display
+groups_to_show <- 10
+```
+
+*** Figure 7A
+```{r rel-abund-genus-skin}
+#Agglomerate at rank
+skin_ps.rank <- tax_glom(skin_ps, taxrank = "Genus") # agglomerate at rank level
+skin_ps.rank.ra <- transform_sample_counts(skin_ps.rank, function(x) {x/sum(x)*100}) # transform to relative abundance
+sample_sums(skin_ps.rank.ra) # everybody adds up to 100 now!
+skin_ps.rank.melt <- psmelt(skin_ps.rank.ra) # melt into long-format table (adds metadata)
+skin_ps.rank.melt # let's take a look at it
+skin_ps.rank.melt <- skin_ps.rank.melt %>% # create new column with mean RA for each phylum
+  group_by(Genus) %>%
+  mutate(mean_rel_abund = mean(Abundance))
+
+# choose top 20 and call the rest "Others"
+top_taxa <- rownames(t(mostAbundant(otu_table(skin_ps.rank.ra), bycol=T, others=T, N=groups_to_show)))
+skin_ps.rank.melt$Genus <- ifelse(skin_ps.rank.melt$OTU %in% top_taxa, skin_ps.rank.melt$Genus, "Others")
+skin_ps.rank.melt$Genus = factor(skin_ps.rank.melt$Genus)
+skin_ps.rank.melt$Genus <- fct_relevel(skin_ps.rank.melt$Genus, "Others", after = Inf) # Move "Others" to the end
+
+
+# specifically control colors by keeping tableau20 palette
+# Get all unique genera
+genera <- unique(skin_ps.rank.melt$Genus)
+# Base Tableau palette
+tableau_colors <- ggthemes::tableau_color_pal("Tableau 20")(length(genera))
+# Create named vector for all genera
+names(tableau_colors) <- genera
+# Override specific colors
+tableau_colors["Candidatus Midichloria"] <- "darkred"
+tableau_colors["Others"] <- "lightgrey"
+
+
+
+ggplot(skin_ps.rank.melt, aes(x= Sample, y= Abundance, fill = Genus)) +
+  facet_wrap(~factor(skin_type, levels = c("control", "non-lesion", "lesion")) +
+               factor(Cohab_day, levels = c("0", "35", "50", "75", "95", "112")),
+             scales = "free_x",
+             nrow = 3,
+             drop = FALSE) +
+  theme_bw(base_size = 12) +
+  labs(y= "Relative Abundance (%)") +
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values = tableau_colors) + 
+  theme(strip.text = element_text(size = 10),
+        axis.text.y = element_text(colour = "black", size = 10),
+        axis.text.x = element_blank(), 
+        axis.title.x = element_blank(),
+        panel.grid = element_blank())
+
+
+```
+
+*** Figure 5
+```{r rel-abund-genus-water}
+#Agglomerate at rank
+water_ps.rank <- tax_glom(wat_ps, taxrank = "Genus") # agglomerate at rank level
+water_ps.rank.ra <- transform_sample_counts(water_ps.rank, function(x) {x/sum(x)*100}) # transform to relative abundance
+sample_sums(water_ps.rank.ra) # everybody adds up to 100 now!
+water_ps.rank.melt <- psmelt(water_ps.rank.ra) # melt into long-format table (adds metadata)
+water_ps.rank.melt # let's take a look at it
+water_ps.rank.melt <- water_ps.rank.melt %>% # create new column with mean RA for each phylum
+  group_by(Genus) %>%
+  mutate(mean_rel_abund = mean(Abundance))
+
+# choose top 20 and call the rest "Others"
+top_taxa <- rownames(t(mostAbundant(otu_table(water_ps.rank.ra), bycol=T, others=T, N=groups_to_show)))
+water_ps.rank.melt$Genus <- ifelse(water_ps.rank.melt$OTU %in% top_taxa, water_ps.rank.melt$Genus, "Others")
+water_ps.rank.melt$Genus = factor(water_ps.rank.melt$Genus)
+water_ps.rank.melt$Genus <- fct_relevel(water_ps.rank.melt$Genus, "Others", after = Inf) # Move "Others" to the end
+
+
+# specifically control colors by keeping tableau20 palette
+# Get all unique genera
+genera <- unique(water_ps.rank.melt$Genus)
+# Base Tableau palette
+tableau_colors <- ggthemes::tableau_color_pal("Tableau 20")(length(genera))
+# Create named vector for all genera
+names(tableau_colors) <- genera
+# Override specific colors
+tableau_colors["Candidatus Midichloria"] <- "darkred"
+tableau_colors["Others"] <- "lightgrey"
+
+ggplot(water_ps.rank.melt, aes(x= Sample, y= Abundance, fill = Genus)) +
+  facet_wrap(~factor(group, levels = c("Control", "RMS cohabitation")) +
+               factor(Cohab_day, levels = c("0", "20", "35", "50", "75", "95", "112")),
+             scales = "free_x",
+             nrow = 2,
+             drop = FALSE) +
+  theme_bw(base_size = 12) +
+  labs(y= "Relative Abundance (%)") +
+  geom_bar(stat = "identity")+
+  ggthemes::scale_fill_tableau("Tableau 20") +
+  theme(strip.text = element_text(size = 10),
+        axis.text.y = element_text(colour = "black", size = 10),
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        panel.grid = element_blank())
+```
+
+
+# Alpha diversities
+
+```{r alpha-div-calculate}
+#Load rarefied dataset
+all_sam_ps <- readRDS(file = "./All_data/all_sam_ps.no.outliers.rarefied.rds")
+all_sam_ps
+# calculate alpha diversity with phyloseq function estimate richness
+alpha_div_1 <- estimate_richness(all_sam_ps, measures = c("Observed","InvSimpson", "Shannon"))
+alpha_div_1 # take a look!
+# calculate evenness pielou with microbiome function evenness()
+alpha_div_2 <- evenness(all_sam_ps,"pielou")
+alpha_div_2 # take a look!
+alpha_div <- cbind(alpha_div_1, alpha_div_2) # combine our two alpha diversities
+alpha_div # take a look!
+alpha_div_meta <- cbind(alpha_div, all_sam_ps@sam_data) # combine alpha div with metadata
+alpha_div_meta # now we have our metadata along with alpha metrics!
+
+#-----------------------------------------------------------------
+# Add metadata
+#-----------------------------------------------------------------
+alpha_div_meta$groupDPC <- paste0(alpha_div_meta$group, alpha_div_meta$Cohab_day)
+
+```
+
+Alpha diversities in skin over time by skin type
+
+*** FIGURE7B
+```{r alpha-div-over-time-shannon}
+## plotting Shannon by skin type and DPC
+ggplot(alpha_div_meta[alpha_div_meta$sample_type == "skin",], aes(x = skin_type, y = Shannon, colour = skin_type)) +
+  geom_boxplot(outlier.shape = NA, size = 0.5, colour = "black", fill = "gray90") +
+  geom_jitter(width = 0.2, size = 1.5, alpha = 0.8) +
+  scale_color_manual(values = c("#1b9e77", "#d95f02", "#b2182b")) +
+  labs(y = "Shannon Index", colour = "Skin type") +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.y = element_text(colour = "black", size = 12),
+    axis.title.y = element_text(size = 16, face = "bold"),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    legend.position = "right",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(), 
+    axis.ticks.x = element_blank(), 
+    axis.ticks.y = element_line(linewidth = 0.4),
+    plot.margin = margin(10, 10, 10, 10)
+  )+
+  facet_wrap(~Cohab_day,
+             nrow = 1)
+
+# stats
+kruskal.test(Shannon ~ skin_type_dpc, data = alpha_div_meta) 
+pairwise.wilcox.test(alpha_div_meta$Shannon, alpha_div_meta$skin_type_dpc, p.adjust.method = "BH")
+```
+
+*** FIGURE 7C
+```{r alpha-div-over-time-pielou}
+## plotting Pielou's evenness
+ggplot(alpha_div_meta[alpha_div_meta$sample_type == "skin",], aes(x = skin_type, y = pielou, colour = skin_type)) +
+  geom_boxplot(outlier.shape = NA, size = 0.5, colour = "black", fill = "gray90") +
+  geom_jitter(width = 0.2, size = 1.5, alpha = 0.8) +
+  scale_color_manual(values = c("#1b9e77", "#d95f02", "#b2182b")) +
+  labs(y = "Evenness", colour = "Skin type") +
+  theme_minimal(base_size = 14) + 
+  theme(
+    axis.text.y = element_text(colour = "black", size = 12),
+    axis.title.y = element_text(size = 16, face = "bold"),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    legend.position = "right",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_line(linewidth = 0.4),
+    plot.margin = margin(10, 10, 10, 10)
+  ) +
+  facet_wrap(~Cohab_day,
+             nrow = 1)
+
+# stats
+kruskal.test(pielou ~ skin_type_dpc, data = alpha_div_meta) 
+pairwise.wilcox.test(alpha_div_meta$pielou, alpha_div_meta$skin_type_dpc, p.adjust.method = "BH") #  NS
+```
+
+Alpha diversities in water over time by water source
+
+*** FIGURE 6A
+```{r alpha-div-over-time-shannon-water}
+## plotting Shannon by condition and DPC
+ggplot(alpha_div_meta[alpha_div_meta$sample_type == "water",], aes(x = group, y = Shannon, colour = group)) +
+  geom_boxplot(outlier.shape = NA, size = 0.5, colour = "black", fill = "gray90") +
+  geom_jitter(width = 0.2, size = 1.5, alpha = 0.8) +
+  scale_color_manual(values = c("#1b9e77", "#b2182b")) + 
+  labs(y = "Shannon Index", colour = "Water source") +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.y = element_text(colour = "black", size = 12),
+    axis.title.y = element_text(size = 16, face = "bold"),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    legend.position = "right",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_line(linewidth = 0.4),
+    plot.margin = margin(10, 10, 10, 10)
+  )+
+  facet_wrap(~Cohab_day,
+             nrow = 1)
+
+#stats not performed as these are technical replicates of filtration
+```
+
+
+*** FIGURE 6B
+```{r alpha-div-over-time-pielou-water}
+## plotting Pielou's evenness
+ggplot(alpha_div_meta[alpha_div_meta$sample_type == "water",], aes(x = group, y = pielou, colour = group)) +
+  geom_boxplot(outlier.shape = NA, size = 0.5, colour = "black", fill = "gray90") +
+  geom_jitter(width = 0.2, size = 1.5, alpha = 0.8) + 
+  scale_color_manual(values = c("#1b9e77", "#b2182b")) +
+  labs(y = "Evenness", colour = "Water source") +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.y = element_text(colour = "black", size = 12),
+    axis.title.y = element_text(size = 16, face = "bold"),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    legend.position = "right",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_line(linewidth = 0.4),
+    plot.margin = margin(10, 10, 10, 10)
+  ) +
+  facet_wrap(~Cohab_day,
+             nrow = 1)
+
+#stats not performed as these are technical replicates of filtration
+```
+
+
+# Beta diversity
+
+```{r data-format-for-gemelli}
+#-------------------------------------------------------------------------------
+# prepare for gemelli at ASV level: skin samples
+#-------------------------------------------------------------------------------
+
+# Read rms.ps
+rms.ps.samples <- readRDS(file = "./All_data/skin_ps.no.outliers.rarefied.rds")
+rms.ps.samples # 1261 taxa and 68 samples
+
+# Extract metadata, tax info, raw counts
+metadata <- as.data.frame(sample_data(rms.ps.samples))
+metadata <- as.data.frame(as(metadata, "data.frame"))
+tax_info <- as.data.frame(tax_table(rms.ps.samples))
+counts <- as.data.frame(otu_table(rms.ps.samples))
+
+# Add ASV name as a column of tax_table and only keep that one
+tax_info$asv_id <- row.names(tax_info)
+# From tax_info, only keep ASV column and merge with counts by rownames
+df <- tax_info[, "asv_id", drop = FALSE]
+# Convert rownames to a new column in both data frames
+df$SampleID <- rownames(df)
+counts <- as.data.frame(t(counts))
+counts$SampleID <- rownames(counts)
+# Merge the two data frames by 'SampleID'
+merged_df <- merge(df, counts, by = "SampleID")
+
+# Set the row names of the merged data frame to 'asv_id' and remove the columns "asv_id" and "SampleID"
+rownames(merged_df) <- merged_df$asv_id
+merged_df$SampleID <- NULL
+merged_df$asv_id <- NULL
+
+write.table(merged_df, file="./All_data/gemelli_asv_no_outliers_rarefied.tsv", quote = FALSE, sep = "\t")
+write.table(metadata, file = "./All_data/all_metadata_filt_no_outl_rarefied.csv", quote = FALSE, sep = ",")
+
+#-------------------------------------------------------------------------------
+# prepare for gemelli at ASV level: water samples
+#-------------------------------------------------------------------------------
+
+# Read rms.ps
+wat_ps <- readRDS(file = "./All_data/wat_ps.no.outliers.rarefied.rds")
+wat_ps # 2043 taxa and 56 samples
+
+# Extract metadata, tax info, raw counts
+metadata <- as.data.frame(sample_data(wat_ps))
+metadata <- as.data.frame(as(metadata, "data.frame"))
+tax_info <- as.data.frame(tax_table(wat_ps))
+counts <- as.data.frame(otu_table(wat_ps))
+
+# Add ASV name as a column of tax_table and only keep that one
+tax_info$asv_id <- row.names(tax_info)
+# From tax_info, only keep ASV column and merge with counts by rownames
+df <- tax_info[, "asv_id", drop = FALSE]
+# Convert rownames to a new column in both data frames
+df$SampleID <- rownames(df)
+counts <- as.data.frame(t(counts))
+counts$SampleID <- rownames(counts)
+# Merge the two data frames by 'SampleID'
+merged_df <- merge(df, counts, by = "SampleID")
+
+# Set the row names of the merged data frame to 'asv_id' and remove the columns "asv_id" and "SampleID"
+rownames(merged_df) <- merged_df$asv_id
+merged_df$SampleID <- NULL
+merged_df$asv_id <- NULL
+
+write.table(merged_df, file="./All_data/gemelli_asv_no_outliers_water_rarefied.tsv", quote = FALSE, sep = "\t")
+write.table(metadata, file = "./All_data/all_metadata_filt_no_outl_water_rarefied.csv", quote = FALSE, sep = ",")
+
+
+```
+
+RPCA is run on server, then results are downloaded and loaded here
+
+RPCA ASV water:
+
+*** FIGURE 6C
+```{r plot-ord-gemelli-asv-water}
+# This script reads the vegan rda object (saved as an R RDS file) for gemelli ordination
+# Plots the ordination with ggplot2
+
+# Read the ord.gemelli RDS file
+ord.gemelli <- readRDS("./All_data/ord-gemelli-asv-rare-water-rda.rds")
+
+##############################################################################
+
+# Load metadata and drop control rows (which are not in ordination)
+metadata <- read.table("./All_data/all_metadata_filt_no_outl_water_rarefied.csv", header=TRUE, sep=",", check.names=FALSE, row.names=1)
+
+################################################################################
+
+#calculate proportion of "variance", here expressed as inertia
+ord.gemelli$CA$eig                                          # access the inertia values
+perc <- ord.gemelli$CA$eig**2/sum(ord.gemelli$CA$eig**2)    # calculate the proportions
+
+# Extract samples PCs in a new df
+ggdf=ord.gemelli$CA$u
+
+# Add metadata
+ggdf <- cbind(ggdf, metadata[rownames(ggdf),])
+
+
+# FIGURE 6C
+# plot ordination with ggplot
+ggplot(ggdf, aes(x=PC1, y=PC2, col=as.factor(Cohab_day), shape = group)) +
+  geom_point(size =3) +
+  scale_colour_manual(values = colours) +
+  labs(title = "Robust Aitchison PCA - ASV Level",
+       shape = "Sample type",
+       color = "DPC",
+       x = paste("PC1 (", round(perc[1]*100, 2), "%)"),
+       y = paste("PC2 (", round(perc[2]*100, 2), "%)")) +
+  theme_bw(base_size=12) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey") +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "grey")
+
+```
+
+*** Figure 8A
+```{r plot-ord-gemelli-asv-skin}
+# This script reads the vegan rda object (saved as an R RDS file) for gemelli ordination
+# Plots the ordination with ggplot2
+
+# Read the ord.gemelli RDS file
+ord.gemelli <- readRDS("./All_data/ord-gemelli-asv-rare-rda.rds")
+
+##############################################################################
+
+# Load metadata and drop control rows (which are not in ordination)
+metadata <- read.table("./All_data/all_metadata_filt_no_outl_rarefied.csv", header=TRUE, sep=",", check.names=FALSE, row.names=1)
+
+################################################################################
+
+#calculate proportion of "variance", here expressed as inertia
+ord.gemelli$CA$eig                                          # access the inertia values
+perc <- ord.gemelli$CA$eig**2/sum(ord.gemelli$CA$eig**2)    # calculate the proportions
+
+# Extract samples PCs in a new df
+ggdf=ord.gemelli$CA$u
+
+# Add metadata
+ggdf <- cbind(ggdf, metadata[rownames(ggdf),])
+
+
+# Set the factor levels for 'development' in the desired order
+ggdf$gross_pathology <- factor(ggdf$gross_pathology, levels = c(
+  "control", 
+  "non-lesion",
+  "active lesion",
+  "Healing or healed"
+))
+
+
+
+#---------------------
+# Extract taxa PCs in a new df
+ggdftx <- as.data.frame(ord.gemelli$CA$v)
+
+# Subset to get only taxa on the extremities of the PC axes
+PC_threshold <- ggdftx[(ggdftx$PC1 > 0.05 | ggdftx$PC1 < -0.05) &
+                      (ggdftx$PC2 > 0.05 | ggdftx$PC2 < -0.05), ]
+
+# Load count matrix, calculate RA for each sample, then subset by taxon with RA> <value>
+counts <- read.table("./All_data/gemelli_asv_no_outliers_rarefied.tsv", sep="\t", row.names=1, header=TRUE, quote="", check.names=FALSE)
+# Transform to relative abundance
+relative_abundance <- sweep(counts, 2, colSums(counts), FUN = "/")
+relative_abundance <- relative_abundance * 100
+
+# Select taxa names that have a mean abundance > <threshold>
+RA_threshold <- rownames(relative_abundance)[rowMeans(relative_abundance) > 0.5]
+
+# Subset PC_threshold by retaining only rows where the row name is in the selected_taxa vector
+PC_RA_threshold <- PC_threshold[rownames(PC_threshold) %in% RA_threshold, ]
+
+
+# Load ps object and extract the taxa in the ordination
+skin_ps <- readRDS("./All_data/skin_ps.no.outliers.rds")
+asv_list <- row.names(PC_RA_threshold)
+asvtaxa <- as.data.frame(tax_table(skin_ps)[asv_list, ])
+
+
+# Add the Label column to PC_RA_threshold where I paste asv and genus
+PC_RA_threshold$Label <- paste0(rownames(PC_RA_threshold), "\n", asvtaxa[rownames(PC_RA_threshold), "Genus"])
+
+# Set the factor levels for 'development' in the desired order
+ggdf$gross_pathology <- factor(ggdf$gross_pathology, levels = c(
+  "control", 
+  "non-lesion",
+  "active lesion",
+  "Healing or healed"
+))
+
+# FIGURE 8A
+# Overlay (NOTE: move the general aesthetics to the correct layers (e.g. week and treatment do not concern geom_text))
+
+ggplot(ggdf, aes(x = PC1, y = PC2)) +
+  geom_point(aes(col = as.factor(Cohab_day), shape = gross_pathology), size = 4) +  # Color dots by week
+  scale_colour_manual(values = colours) +
+  labs(title = "Robust Aitchison PCA - ASV Level",
+       shape = "Sample Type",
+       color = "DPC",
+       x = paste("PC1 (", round(perc[1] * 100, 2), "%)", sep = ""),
+       y = paste("PC2 (", round(perc[2] * 100, 2), "%)", sep = "")) +
+  theme_bw(base_size=12) +
+  geom_text(data = PC_RA_threshold,
+            aes(x = PC1, y = PC2, label = Label),
+            vjust = -1, size = 2.5, color = "black", lineheight = 0.75,
+            fontface = "italic") +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey") +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "grey") +
+  xlim(-0.32, 0.45) +
+  ylim(-0.32, 0.5)
+```
+
+*** Figure 8B
+```{r plot-skin-asvs-rel-abund}
+# Plot boxplots of selected taxa across variable groups
+
+# Load metadata 
+metadata <- read.table("./data/all_metadata_filt_no_outl_rarefied.csv", header=TRUE, sep=",", check.names=FALSE, row.names=1)
+
+################################################################################
+
+# Load asv count matrix, calculate RA for each sample
+counts <- read.table("./data/gemelli_asv_no_outliers_rarefied.tsv", sep="\t", row.names=1, header=TRUE, quote="", check.names=FALSE)
+# Transform to relative abundance
+relative_abundance <- sweep(counts, 2, colSums(counts), FUN = "/")
+relative_abundance <- relative_abundance * 100
+
+##############################################################################
+
+# Convert metadata to df
+metadata$sample_nr <- rownames(metadata)
+metadata <- as.data.frame(metadata)
+
+# Ensure that the sample IDs in metadata match the rows in the abundance matrix
+metadata$sample_nr <- colnames(relative_abundance)
+relative_abundance <- t(relative_abundance)
+metadata$sample_nr <- rownames(relative_abundance)
+
+# Rel. ab. as df
+relative_abundance <- as.data.frame(relative_abundance)
+relative_abundance$sample_nr <- rownames(relative_abundance)
+
+# Reshape abundance matrix for easier merging
+abundance_long <- relative_abundance %>%
+  pivot_longer(-sample_nr, names_to = "Taxa", values_to = "Abundance")
+
+# Merge abundance data with metadata
+merged_data <- abundance_long %>%
+  inner_join(metadata, by = "sample_nr")
+
+# Select specific taxa (e.g., Acinetobacter, Pseudomonas)
+selected_taxa <- rownames(PC_RA_threshold)
+
+# Filter the data for the selected taxa
+filtered_data <- merged_data[merged_data$Taxa %in% selected_taxa,]
+
+# Add label column
+filtered_data$Label <- PC_RA_threshold[filtered_data$Taxa, "Label"]
+
+# Re-order the gross pathology terms before plotting
+filtered_data$gross_pathology = factor(filtered_data$gross_pathology, levels = c("control",
+                                                 "non-lesion",                                                      "active lesion",
+                                                 "Healing or healed"))
+
+
+# Calculate mean abundance for each group for the selected taxa
+mean_abundance <- filtered_data %>%
+  group_by(gross_pathology, Label) %>%
+  summarise(mean_abundance = mean(Abundance),
+    sd = sd(Abundance) / sqrt(n())
+    ) %>%
+  ungroup()
+
+# FIGURE 8B
+# Plot the mean abundances for the selected taxa by group using ggplot2
+ggplot(mean_abundance, aes(x = gross_pathology, y = mean_abundance, fill = gross_pathology)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = mean_abundance - sd, ymax = mean_abundance + sd), width = 0.2) +
+  facet_wrap(~ Label, scales = "free") +  # Separate plots for each selected Taxa
+  theme_minimal() +
+  scale_fill_manual(values = colours, labels = new_labels)+
+  labs(y = "Mean Relative Abundance (%)",
+       fill = "Gross pathology",
+       x = "") +
+  theme(axis.text.x = element_blank())
+
+
+```
+
+
+# Differential abundance analysis
+```{r data-prep-da}
+ps.samples <- readRDS(file = "./All_data/skin_ps.no.outliers.rds")
+ps.samples #1541 taxa and 70 samples
+
+# Exclude the sample that was removed in the rarefaction process. this way, all analyses are done with the same samples
+ps.samples <- subset_samples(ps.samples, !rownames(sample_data(ps.samples)) %in% c("s22.379.61"))
+ps.samples #1541 taxa and 69 samples
+
+# Remove zero counts taxa
+#remove zero count taxa
+ps.samples <- prune_taxa(taxa_sums(ps.samples) >= 1, ps.samples)
+ps.samples # 1510 taxa and 69 samples
+
+# Extract metadata, tax info, raw counts
+metadata <- as.data.frame(sample_data(ps.samples))
+metadata <- as.data.frame(as(metadata, "data.frame"))
+tax_info <- as.data.frame(tax_table(ps.samples))
+tax_info$asv <- rownames(tax_info)
+counts <- as.data.frame(otu_table(ps.samples))
+
+# Add metadata column: active lesion vs rest
+metadata$active_lesion[metadata$gross_pathology %in% c("control", "non-lesion", "Healing or healed")] <- "No active lesion or control"
+metadata$active_lesion[metadata$gross_pathology == "active lesion"] <- "Active lesion"
+
+# Add fishID as the same as PIT, but replace NAs with numbers
+metadata$fishID <- metadata$PIT
+# Replace NAs with sequential numbers
+metadata$fishID[is.na(metadata$fishID)] <- seq_len(sum(is.na(metadata$fishID)))
+metadata$fishID <- as.numeric(metadata$fishID)
+
+# Add tank_nr where i replace common with a random number (e.g.1) and set variable to numerical for ancombc
+metadata$tank_nr <- metadata$tank
+metadata$tank_nr[metadata$tank_nr == "common"] <- 1
+metadata$tank_nr <- as.numeric(metadata$tank_nr)
+
+
+# Relative abundance ASV level
+# Transform to relative abundance
+relative_abundance_asv <- sweep(counts, 1, rowSums(counts), FUN = "/")
+relative_abundance_asv <- relative_abundance_asv * 100
+rowSums(relative_abundance_asv) # all samples sum up to 100
+```
+
+Default is FDR=0.05.
+
+From the vignette: we recommend that the number of samples in the smallest group multiplied by the number of DMC be equal at least 1000 in order to generate a reasonably stable estimate of the posterior distribution.
+My smallest group is =6: so 1000/6=166.6 > 170.
+
+```{r aldex-lesions-glm-calculate, eval=F}
+aldex_counts <- (t(counts))
+# Reorder so that untreated is the baseline
+metadata$gross_pathology = factor(metadata$gross_pathology, levels = c("control" ,"non-lesion", "active lesion", "Healing or healed"))
+
+# # Without taking into account cohabitation day variable
+# mm <- model.matrix(~ gross_pathology, metadata)
+
+# Taking into account the COhabitation day variable
+mm <- model.matrix(~ gross_pathology + Cohab_day, metadata)
+x.glm <- aldex.clr(aldex_counts, mm, mc.samples=170, denom="all", verbose=T)
+glm.test <- aldex.glm(x.glm, mm, fdr.method='holm')
+glm.eff<- aldex.glm.effect(x.glm, CI = TRUE)
+
+aldex_glm_outputs <- list(x.glm = x.glm,
+                          glm.test = glm.test,
+                          glm.eff = glm.eff)
+
+saveRDS(object = aldex_glm_outputs,
+        file = "./All_data/aldex_glm_outputs.RDS")
+
+```
+
+Volcano plots for each category
+```{r aldex-lesions-glm-plot}
+
+aldex_glm_outputs <- readRDS(file = "./All_data/aldex_glm_outputs.RDS")
+x.glm <- aldex_glm_outputs$x.glm
+glm.test <- aldex_glm_outputs$glm.test
+glm.eff <- aldex_glm_outputs$glm.eff
+
+# Plot only volcano plot only
+aldex.glm.plot(glm.test, eff=glm.eff, contrast='gross_pathologyactive lesion', type='volcano', test='fdr')
+
+# NEW plot the glm.test and glm.eff data for particular contrasts (variables, in this case active lesion)
+par(mfrow=c(1,3))
+aldex.glm.plot(glm.test, eff=glm.eff, contrast='gross_pathologyactive lesion', type='MA', test='fdr')
+aldex.glm.plot(glm.test, eff=glm.eff, contrast='gross_pathologyactive lesion', type='MW', test='fdr', called.col = "red")
+aldex.glm.plot(glm.test, eff=glm.eff, contrast='gross_pathologyactive lesion', type='volcano', test='fdr')
+mtext("Active lesion skin samples", side = 3, line = -2, outer = TRUE)
+
+
+# NEW plot the glm.test and glm.eff data for particular contrasts (variables, in this case non-lesion)
+par(mfrow=c(1,3))
+aldex.glm.plot(glm.test, eff=glm.eff, contrast='gross_pathologynon-lesion', type='MA', test='fdr')
+aldex.glm.plot(glm.test, eff=glm.eff, contrast='gross_pathologynon-lesion', type='MW', test='fdr', called.col = "red")
+aldex.glm.plot(glm.test, eff=glm.eff, contrast='gross_pathologynon-lesion', type='volcano', test='fdr')
+mtext("Non-lesion skin samples", side = 3, line = -2, outer = TRUE)
+
+
+# NEW plot the glm.test and glm.eff data for particular contrasts (variables, in this case Healing or healed)
+par(mfrow=c(1,3))
+aldex.glm.plot(glm.test, eff=glm.eff, contrast='gross_pathologyHealing or healed', type='MA', test='fdr')
+aldex.glm.plot(glm.test, eff=glm.eff, contrast='gross_pathologyHealing or healed', type='MW', test='fdr', called.col = "red")
+aldex.glm.plot(glm.test, eff=glm.eff, contrast='gross_pathologyHealing or healed', type='volcano', test='fdr')
+mtext("Healing or healed skin samples", side = 3, line = -2, outer = TRUE)
+
+```
+
+
+No ASVs are considered differentially abundant between baseline condition (control) and non-lesion or healed lesions samples.
+
+
+However, in the active lesions group, one ASV is considered differentially abundant.
+
+Which one is it?
+
+Find significant DA features in each category:
+```{r DA-asv, results='asis'}
+lesion_glm_eff <- glm.eff$`gross_pathologyactive lesion`
+# select pvalue adj <0.05
+glm.test[glm.test$`gross_pathologyactive lesion:pval.padj` < 0.05,]
+glm.test[glm.test$`gross_pathologynon-lesion:pval.padj` < 0.05,]
+glm.test[glm.test$`gross_pathologyHealing or healed:pval.padj` < 0.05,]
+```
+
+# Correlation between ASV22 and ASV14/ASV32
+
+***  Suppl. Figure 6A
+```{r check asv_0032 and asv_0014 RA from rawcounts}
+# Reshape abundance matrix for easier merging
+relative_abundance_asv$sample_nr <- rownames(relative_abundance_asv)
+abundance_long <- pivot_longer(relative_abundance_asv, cols = -sample_nr, names_to = "Taxa", values_to = "Abundance")
+
+# Merge abundance data with metadata
+metadata$sample_nr <- rownames(metadata)
+merged_data <- inner_join(abundance_long, metadata, by = "sample_nr")
+
+# Selected taxa: asv_0032 (Candidatus Branchiomonas) and asv_0014 (Unclassified Gammaproteobacteria)
+asvs_of_interest <- merged_data[merged_data$Taxa %in% c("asv_0032", "asv_0014", "asv_0022"),]
+
+# Re-order the gross pathology terms before plotting
+asvs_of_interest$gross_pathology = factor(asvs_of_interest$gross_pathology, levels = c("control",
+                                                 "non-lesion",                                                      "active lesion",
+                                                 "Healing or healed"))
+
+# SUPPL FIGURE 5A
+# CONTROLS ONLY: Plot by day and taxa
+ggplot(asvs_of_interest[asvs_of_interest$gross_pathology == "control",], aes(x = Taxa, y = Abundance, fill = Taxa))+
+  scale_fill_manual(values = colours) +
+  geom_boxplot(alpha = 0.9) +
+  facet_grid(~ Cohab_day) +
+  theme_minimal() +
+  labs(y = "Relative Abundance (%)\nControl samples only",
+       x = "",
+       fill = "ASV") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# COHABITATION ONLY: Plot by day and taxa
+ggplot(asvs_of_interest[asvs_of_interest$gross_pathology %in% c("non-lesion", "active lesion", "Healing or healed"),], aes(x = Taxa, y = Abundance, fill = Taxa))+
+  scale_fill_manual(values = colours) +
+  geom_boxplot(alpha = 0.9) +
+  geom_point() +
+  facet_wrap(~ Cohab_day, scales = "free", nrow = 1) +
+  theme_minimal() +
+  labs(y = "Relative Abundance (%)\nCohabitation tank samples only",
+       x = "",
+       fill = "ASV") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Print out counts in control samples
+asvs_of_interest_in_controls <- asvs_of_interest[asvs_of_interest$gross_pathology == "control" & asvs_of_interest$Abundance != 0,]
+```
+
+Are ASV 22 and ASV 14 relative abundances by fish correlated?
+
+*** Suppl. Figure 6B
+```{r correlation_asv14_asv22, results='asis'}
+# From the relative abundance table, select asv columns
+df_wide <- relative_abundance_asv[, c("asv_0014", "asv_0022", "sample_nr")]
+
+# take into account fish identity (PIT number): merge metadata by sample_nr
+df_wide_md <- merge(df_wide, metadata, by="sample_nr")
+
+#exclude samples where I do not have PIT ID (SPF fish at dpc 0)
+avg_by_pit <- df_wide_md[!is.na(df_wide_md$PIT),]
+length(unique(avg_by_pit$PIT)) # check how many unique fish (PIT): 46
+
+# calculate avg asv_0014 by fish
+asv_0014_by_pit <- aggregate(asv_0014 ~ PIT, avg_by_pit, mean)
+# same for asv_0022 by fish
+asv_0022_by_pit <- aggregate(asv_0022 ~ PIT, avg_by_pit, mean)
+
+# merge by pit
+asv14_22_by_pit <- merge(asv_0014_by_pit, asv_0022_by_pit, by="PIT")
+# merge with metadata by pit to have the Cohab_day
+asv14_22_by_pit <- merge(asv14_22_by_pit, metadata[,c("PIT", "Cohab_day")], by="PIT")
+# remove duplicates
+asv14_22_by_pit <- asv14_22_by_pit[!duplicated(asv14_22_by_pit),]
+
+# SUPPL FIGURE 5B
+# plot log10 (x+1)
+ggplot(asv14_22_by_pit, aes(x = log10(asv_0022 + 1), y = log10(asv_0014 +1))) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.1, colour = "black")  +
+  ggpubr::stat_cor(cor.coef.name = "R", p.accuracy = 0.001, label.y = 2.1) +
+  guides(fill = "none") +
+  theme_minimal(base_size = 14, base_family = "sans") + 
+  theme(
+    panel.grid.major = element_blank(),  
+    panel.grid.minor = element_blank(),  
+    axis.line = element_line(size = 0.5, color = "grey"), 
+    panel.border = element_rect(color = "grey", fill = NA, linewidth = 0.5),
+    legend.position = "right",  
+    legend.title = element_text(size = 12),  
+    legend.text = element_text(size = 12),
+    axis.title = element_text(size = 14),  
+    axis.text = element_text(size = 12),  
+    plot.title = element_text(size = 16)  
+  ) +
+  labs(
+    x = "Relative Abundance (%) of ASV 22\nCa. Midichloria",
+    y = "Relative Abundance (%) of ASV 14\nuncl. gammaproteobacterium"
+  )
+
+# Compute R2 values and p-values log10 scale
+cor_test_log <- cor.test(log10(asv14_22_by_pit$asv_0014 + 1), 
+                           log10(asv14_22_by_pit$asv_0022 + 1),
+                           use = "complete.obs")
+r_pearson_log <- cor_test_log$estimate
+pval_pearson_log <- cor_test_log$p.value
+print(paste0("Corr. Pearson log ASV 22 and 14: R=", r_pearson_log, ", pvalue=", pval_pearson_log))
+
+```
+
+Are ASV 22 and ASV 32 relative abundances by fish correlated?
+
+```{r correlation_asv32_asv22, results='asis'}
+# From the relative abundance table, select asv columns
+df_wide <- relative_abundance_asv[c("asv_0032", "asv_0022", "sample_nr")]
+
+# take into account PIT number : merge metadata by sample_nr
+df_wide_md <- merge(df_wide, metadata, by="sample_nr")
+#exclude samples where I do not have PIT ID
+avg_by_pit <- df_wide_md[!is.na(df_wide_md$PIT),]
+length(unique(avg_by_pit$PIT)) # check how many unique PIT id i have: 46
+
+# calculate avg asv_0032
+asv_0032_by_pit <- aggregate(asv_0032 ~ PIT, avg_by_pit, mean)
+# same for asv_0022
+asv_0022_by_pit <- aggregate(asv_0022 ~ PIT, avg_by_pit, mean)
+
+# merge by pit
+asv32_22_by_pit <- merge(asv_0032_by_pit, asv_0022_by_pit, by="PIT")
+# merge with metadata by pit to have the Cohab_day
+asv32_22_by_pit <- merge(asv32_22_by_pit, metadata[,c("PIT", "Cohab_day")], by="PIT")
+# remove duplicates
+asv32_22_by_pit <- asv32_22_by_pit[!duplicated(asv32_22_by_pit),]
+
+# plot log10 (x+1)
+ggplot(asv32_22_by_pit, aes(x = log10(asv_0022 + 1), y = log10(asv_0032 +1))) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.1, colour = "black")  +
+  ggpubr::stat_cor(cor.coef.name = "R", p.accuracy = 0.001, label.y = 2.1) +
+  guides(fill = "none") +
+  theme_minimal(base_size = 14, base_family = "sans") + 
+  theme(
+    panel.grid.major = element_blank(),  
+    panel.grid.minor = element_blank(),  
+    axis.line = element_line(size = 0.5, color = "grey"), 
+    panel.border = element_rect(color = "grey", fill = NA, linewidth = 0.5),
+    legend.position = "right",  
+    legend.title = element_text(size = 12),  
+    legend.text = element_text(size = 12),
+    axis.title = element_text(size = 14),  
+    axis.text = element_text(size = 12),  
+    plot.title = element_text(size = 16)  
+  ) +
+  labs(
+    x = "Relative Abundance (%) of ASV 22\nCa. Midichloria",
+    y = "Relative Abundance (%) of ASV 32\nCa. Branchiomonas"
+  )
+
+
+# Compute R2 values and p-values log10 scale
+cor_test_log <- cor.test(log10(asv32_22_by_pit$asv_0032 + 1), 
+                           log10(asv32_22_by_pit$asv_0022 + 1),
+                           use = "complete.obs")
+r_pearson_log <- cor_test_log$estimate
+pval_pearson_log <- cor_test_log$p.value
+
+print(paste0("Corr. Pearson LOG ASV 22 and 32: R=", r_pearson_log, ", pvalue=", pval_pearson_log))
+
+```
